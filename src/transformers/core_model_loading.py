@@ -379,10 +379,6 @@ def set_param_for_module(
     with log_to_misc(full_param_name, misc, full_param_name):
         module_path, _, param_name = full_param_name.rpartition(".")
         module_obj = model.get_submodule(module_path) if module_path else model
-        if isinstance(param_value, list):
-            param_value = param_value[0]
-        elif not isinstance(param_value, torch.nn.Parameter):
-            param_value = param_value[...]
         ref = getattr(module_obj, param_name)
 
         use_dtensor = hasattr(distributed_operation, "use_dtensor") and distributed_operation.use_dtensor
@@ -564,6 +560,7 @@ def convert_and_load_state_dict_in_model(
                                     )
 
                         for k, output_value in realized_value.items():
+                            output_value = output_value[0] if isinstance(output_value, list) else output_value
                             for src in converter.source_keys:  # what should happen to k when we meet k at saving
                                 inverse_converters[k] = {src: converter}
 
