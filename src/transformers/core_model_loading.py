@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
+from .integrations.accelerate import offload_weight
 from .integrations.tensor_parallel import ALL_PARALLEL_STYLES, DTensor, Replicate, TensorParallelLayer
 from .utils import is_torch_greater_or_equal, logging
 
@@ -328,7 +329,7 @@ def dot_natural_key(s: str):
 
 @contextmanager
 def log_to_misc(
-    layer_name: str,
+    full_param_name: str,
     misc: MutableMapping[str, str],
     extras: Any = None,
     op: Union[list[ConversionOps], ConversionOps, None] = None,
@@ -352,22 +353,22 @@ def log_to_misc(
         if isinstance(extras, tuple) and len(extras) == 2:
             values, target_keys = extras
             descriptor = f"{op_name} " if op_name else ""
-            misc[layer_name] = (
+            misc[full_param_name] = (
                 f"{e}\nError: {descriptor}on tensors destined for {target_keys}. Ckpt contains: {len(values[0])}"
             )
         elif isinstance(extras, str):
             suffix = f" via {op_name}" if op_name else ""
-            misc[layer_name] = f"{e}\nError{suffix} when processing parameter {extras}"
+            misc[full_param_name] = f"{e}\nError{suffix} when processing parameter {extras}"
         elif extras is None and op_name:
-            misc[layer_name] = f"{op_name}: {e}"
+            misc[full_param_name] = f"{op_name}: {e}"
         else:
-            misc[layer_name] = f"{extras} |Error: {e}"
+            misc[full_param_name] = f"{extras} |Error: {e}"
         raise SkipLayer()
 
 
 def set_param_for_module(
     model: PreTrainedModel,
-    layer_name: str,
+    full_param_name: str,
     param_value: torch.Tensor,
     mismatch_keys: MutableSet[tuple[str, torch.Size, torch.Size]],
     missing_keys: MutableSet[str],
@@ -375,8 +376,8 @@ def set_param_for_module(
     distributed_operation: Optional[TensorParallelLayer],
     hf_quantizer: HfQuantizer,
 ):
-    with log_to_misc(layer_name, misc, layer_name):
-        module_path, _, param_name = layer_name.rpartition(".")
+    with log_to_misc(full_param_name, misc, full_param_name):
+        module_path, _, param_name = full_param_name.rpartition(".")
         module_obj = model.get_submodule(module_path) if module_path else model
         if isinstance(param_value, list):
             param_value = param_value[0]
@@ -402,9 +403,9 @@ def set_param_for_module(
                 param_value = torch.nn.Parameter(param_value, requires_grad=param_value.is_floating_point())
 
         # Remove from missing keys (it's either mismatched, or all good)
-        missing_keys.discard(layer_name)
+        missing_keys.discard(full_param_name)
         if ref is not None and ref.shape != param_value.shape and hf_quantizer is None:
-            mismatch_keys.add((layer_name, param_value.shape, ref.shape))
+            mismatch_keys.add((full_param_name, param_value.shape, ref.shape))
             module_obj.param_name._is_hf_initialized = False  # Needs to be initialized
         else:
             param_value._is_hf_initialized = True  # super important otherwise _init_weight re-initi if bias is missing
@@ -427,6 +428,8 @@ def convert_and_load_state_dict_in_model(
     device_map: dict | None = None,
     dtype_plan: dict | None = None,
     device_mesh: torch.distributed.device_mesh.DeviceMesh | None = None,
+    disk_offload_index: dict | None = None,
+    disk_offload_folder: str | None = None,
 ):
     """
     Convert a state dict according to a weight mapping (one WeightConverter per glob pattern),
@@ -518,7 +521,7 @@ def convert_and_load_state_dict_in_model(
                     shard_index,
                 )
 
-        if future is None:  # If not TP, async materialize the tensors. TODO handle disk offload?
+        if future is None:
             device_match = device_map_regex.match(first_target_key)
             param_device = device_map[device_match.group()] if device_match else device_map.get("", "cpu")
             future = spawn_materialize(thread_pool, tensor, param_device, _dtype)
@@ -533,29 +536,29 @@ def convert_and_load_state_dict_in_model(
             group = by_conversion_pattern.pop(key)
             converter = group.weight_converter
             operations = converter.operations if isinstance(converter.operations, list) else [converter.operations]
-            for layer_name, tensors_for_this_layer in group.collected_tensors.items():
+            for full_param_name, tensors_for_this_layer in group.collected_tensors.items():
                 pbar.update(1)
-                pbar.set_postfix({"Materializing param": layer_name})
+                pbar.set_postfix({"Materializing param": full_param_name})
                 pbar.refresh()
-                concrete_target_keys = layer_name.split("|")
+                concrete_target_keys = full_param_name.split("|")
                 try:
                     if bool(set(concrete_target_keys) - unexpected_keys):
-                        with log_to_misc(layer_name, misc):
+                        with log_to_misc(full_param_name, misc):
                             values = [[k.result() for k in inner] for inner in tensors_for_this_layer.values()]
 
                         for op in operations:
-                            with log_to_misc(layer_name, misc, (values, concrete_target_keys), operations):
+                            with log_to_misc(full_param_name, misc, (values, concrete_target_keys), operations):
                                 values = op.convert(values, model.config)
 
                         values = [values] if not isinstance(values, list) else values
-                        with log_to_misc(layer_name, misc, (values, concrete_target_keys), operations):
+                        with log_to_misc(full_param_name, misc, (values, concrete_target_keys), operations):
                             realized_value = {
                                 k: t for k, t in zip(concrete_target_keys, values) if k not in unexpected_keys
                             }
 
                         for k in list(realized_value.keys()).copy():
                             if op := converter.quantization_operation:
-                                with log_to_misc(layer_name, misc, op=op):
+                                with log_to_misc(full_param_name, misc, op=op):
                                     realized_value.update(
                                         op.convert({k: realized_value.pop(k)}, model=model, missing_keys=missing_keys)
                                     )
@@ -563,16 +566,27 @@ def convert_and_load_state_dict_in_model(
                         for k, output_value in realized_value.items():
                             for src in converter.source_keys:  # what should happen to k when we meet k at saving
                                 inverse_converters[k] = {src: converter}
-                            set_param_for_module(
-                                model,
-                                k,
-                                output_value,
-                                mismatch_keys,
-                                missing_keys,
-                                misc,
-                                converter.distributed_operation,
-                                hf_quantizer,
-                            )
+
+                            param_device = device_map[re.search(device_map_regex, k).group()]
+                            # Offloading support
+                            if param_device == "disk":
+                                missing_keys.discard(k)
+                                # If not already offloaded, or if we applied any special Operation, we need to re-save
+                                if k not in disk_offload_index or len(operations) > 0:
+                                    disk_offload_index = offload_weight(
+                                        output_value, k, disk_offload_folder, disk_offload_index
+                                    )
+                            else:
+                                set_param_for_module(
+                                    model,
+                                    k,
+                                    output_value,
+                                    mismatch_keys,
+                                    missing_keys,
+                                    misc,
+                                    converter.distributed_operation,
+                                    hf_quantizer,
+                                )
 
                 except SkipLayer:
                     continue
