@@ -435,8 +435,9 @@ def convert_and_load_state_dict_in_model(
     prefix = model.base_model_prefix
     tp_plan = tp_plan or {}  # {glob_pattern: plan_obj_or_key}
     device_map = device_map or {"": "cpu"}  # {exact_target_key: device}
+    # Here, we first sort by number of submodules, then length of the full string, to make sure to match correctly
     device_map_regex = re.compile(
-        "|".join(rf"({k})" for k in sorted(device_map.keys(), key=lambda x: x.count("."), reverse=True))
+        "|".join(rf"({k})" for k in sorted(device_map.keys(), key=lambda x: (x.count("."), len(x)), reverse=True))
     )
     dtype_plan = dtype_plan or {}  # {glob_pattern: dtype}
     weight_mapping = weight_mapping or {}  # {glob_pattern: WeightConverter}
