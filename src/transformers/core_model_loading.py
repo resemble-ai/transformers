@@ -520,6 +520,8 @@ def convert_and_load_state_dict_in_model(
         if future is None:
             device_match = device_map_regex.match(first_target_key)
             param_device = device_map[device_match.group()] if device_match else device_map.get("", "cpu")
+            # For offloading, we first materialize to cpu
+            param_device = "cpu" if param_device == "disk" else param_device
             future = spawn_materialize(thread_pool, tensor, param_device, _dtype)
         entry.collected_tensors[target_key].setdefault(converter_key, []).append(future)
 
@@ -564,7 +566,10 @@ def convert_and_load_state_dict_in_model(
                             for src in converter.source_keys:  # what should happen to k when we meet k at saving
                                 inverse_converters[k] = {src: converter}
 
-                            param_device = device_map[re.search(device_map_regex, k).group()]
+                            device_match = device_map_regex.match(k)
+                            param_device = (
+                                device_map[device_match.group()] if device_match else device_map.get("", "cpu")
+                            )
                             # Offloading support
                             if param_device == "disk":
                                 missing_keys.discard(k)
