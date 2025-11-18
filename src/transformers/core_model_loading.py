@@ -329,7 +329,7 @@ def dot_natural_key(s: str):
 
 @contextmanager
 def log_to_misc(
-    full_param_name: str,
+    all_target_keys: str,
     misc: MutableMapping[str, str],
     extras: Any = None,
     op: Union[list[ConversionOps], ConversionOps, None] = None,
@@ -353,16 +353,16 @@ def log_to_misc(
         if isinstance(extras, tuple) and len(extras) == 2:
             values, target_keys = extras
             descriptor = f"{op_name} " if op_name else ""
-            misc[full_param_name] = (
+            misc[all_target_keys] = (
                 f"{e}\nError: {descriptor}on tensors destined for {target_keys}. Ckpt contains: {len(values[0])}"
             )
         elif isinstance(extras, str):
             suffix = f" via {op_name}" if op_name else ""
-            misc[full_param_name] = f"{e}\nError{suffix} when processing parameter {extras}"
+            misc[all_target_keys] = f"{e}\nError{suffix} when processing parameter {extras}"
         elif extras is None and op_name:
-            misc[full_param_name] = f"{op_name}: {e}"
+            misc[all_target_keys] = f"{op_name}: {e}"
         else:
-            misc[full_param_name] = f"{extras} |Error: {e}"
+            misc[all_target_keys] = f"{extras} |Error: {e}"
         raise SkipLayer()
 
 
@@ -534,29 +534,29 @@ def convert_and_load_state_dict_in_model(
             group = by_conversion_pattern.pop(key)
             converter = group.weight_converter
             operations = converter.operations if isinstance(converter.operations, list) else [converter.operations]
-            for full_param_name, tensors_for_this_layer in group.collected_tensors.items():
+            for all_target_keys, tensors_for_this_layer in group.collected_tensors.items():
                 pbar.update(1)
-                pbar.set_postfix({"Materializing param": full_param_name})
+                pbar.set_postfix({"Materializing param": all_target_keys})
                 pbar.refresh()
-                concrete_target_keys = full_param_name.split("|")
+                concrete_target_keys = all_target_keys.split("|")
                 try:
                     if bool(set(concrete_target_keys) - unexpected_keys):
-                        with log_to_misc(full_param_name, misc):
+                        with log_to_misc(all_target_keys, misc):
                             values = [[k.result() for k in inner] for inner in tensors_for_this_layer.values()]
 
                         for op in operations:
-                            with log_to_misc(full_param_name, misc, (values, concrete_target_keys), operations):
+                            with log_to_misc(all_target_keys, misc, (values, concrete_target_keys), operations):
                                 values = op.convert(values, model.config)
 
                         values = [values] if not isinstance(values, list) else values
-                        with log_to_misc(full_param_name, misc, (values, concrete_target_keys), operations):
+                        with log_to_misc(all_target_keys, misc, (values, concrete_target_keys), operations):
                             realized_value = {
                                 k: t for k, t in zip(concrete_target_keys, values) if k not in unexpected_keys
                             }
 
                         for k in list(realized_value.keys()).copy():
                             if op := converter.quantization_operation:
-                                with log_to_misc(full_param_name, misc, op=op):
+                                with log_to_misc(all_target_keys, misc, op=op):
                                     realized_value.update(
                                         op.convert({k: realized_value.pop(k)}, model=model, missing_keys=missing_keys)
                                     )
