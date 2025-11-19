@@ -22,12 +22,12 @@ from functools import partial
 from itertools import count
 from math import ceil
 from time import perf_counter
-from tqdm.contrib.logging import logging_redirect_tqdm
 from typing import Optional
 
 import torch
 from torch import nn
 from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from ...configuration_utils import PretrainedConfig
 from ...generation.configuration_utils import GenerationConfig
@@ -1088,7 +1088,9 @@ class ContinuousMixin:
         try:
             yield manager
         finally:
-            logger.debug("Continuous batching loop finished") # a dummy log needed for the logs of stop to show. Won't show
+            logger.debug(
+                "Continuous batching loop finished"
+            )  # a dummy log needed for the logs of stop to show. Won't show
             manager.stop(block=block, timeout=timeout)
 
     # NOTE: don't forget to update `continuous_batching_context_manager` when changing this method's definition
